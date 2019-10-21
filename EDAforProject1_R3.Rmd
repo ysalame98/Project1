@@ -1,0 +1,369 @@
+---
+title: 'EDA for Project 1: Beer and Brewery in the States'
+author: "Hao Wang"
+date: "10/14/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Get the data
+```{r}
+setwd("C:/Edu/GitHub_DDS/Unit 8")
+BeersDF <- read.csv(file = "Beers.csv", header = TRUE)
+BreweriesDF <- read.csv(file = "Breweries.csv", header = TRUE)
+```
+
+# Active library
+```{r}
+# Visualization
+library(tidyverse)
+library(plotly)
+library(plyr)
+library(dplyr)
+library(maps)
+library(inspectdf)
+library(VIM)
+library(ggthemes)
+
+# data wrangling 
+library(stringr)
+library(tm)
+library(knitr)
+library(sqldf)
+
+# classification and modeling
+library(class)
+library(e1071)
+library(caret)
+```
+
+# 1. How many breweries are present in each state?
+```{r}
+# Count breweries in each state
+table(BreweriesDF$State)
+
+Brew_Num <- BreweriesDF %>%
+  group_by(State) %>%
+  dplyr::summarize(count=n())
+     
+# Plot
+Brew_Num$State = factor(Brew_Num$State, level = Brew_Num$State[order(-Brew_Num$count)]) 
+Brew_Num %>% 
+  ggplot(aes(x=State, y=count, fill=State))+geom_bar(stat = "identity", width = 0.8) +
+  ylab("Brewery")+ggtitle("Brewery vs State")+
+  geom_text(aes(label=count), hjust=0.4, vjust=-0.3, size=3) +
+  theme(axis.text.x = element_text(size=7, angle=90))
+ggplotly()
+```
+
+# 2. Merge beer data with the breweries data. 
+# Print the first 6 observations and the last six observations to check the merged file.
+# (RMD only, this does not need to be included in the presentation or the deck.)
+```{r}
+mergeDF <- merge(BeersDF, BreweriesDF, by.x = "Brewery_id", by.y = "Brew_ID")
+colnames(mergeDF)[2] = "Beer_name"
+colnames(mergeDF)[8] = "Brewery_name"
+print("The first 6 observations of the merged file:")
+head(mergeDF, n=6)
+print("The last 6 observations of the merged file:")
+tail(mergeDF, n=6)
+```
+
+# 3. Address the missing values in each column.
+## Option 1: Simply replacing missing values in IBU/ABV with state median results in significant drop on correlation, from 67% to 49% (Refer to #7)
+```{r}
+# Check the missing values in the mergeDF
+aggr(mergeDF, prop=FALSE, numbers=TRUE)
+matrixplot(mergeDF)
+marginplot(mergeDF[c("ABV","IBU")], pch = c(20), col = c("darkgray", "red", "blue"))
+IBUNADF <-  mergeDF %>% filter(is.na(IBU))
+ABVNADF <-  mergeDF %>% filter(is.na(ABV))
+BOTHNADF <- mergeDF %>% filter(is.na(ABV) & is.na(IBU))
+# Check which state give the most NA's
+summary(IBUNADF$State)
+summary(mergeDF$State)
+summary(ABVNADF$State)
+# NADF <- data.frame(State=State, ALL=summary(mergeDF$State), IBUNA=summary(IBUNADF$State), ABVNA=summary(ABVNADF$State))
+# NADF$IBUNAperc <- NADF$IBUNA/NADF$ALL
+# NADF$ABVNAperc <- NADF$ABVNA/NADF$ALL
+
+# Calculate IBU and ABV median value of each state
+IBUmedianState <- mergeDF %>% filter(!is.na(IBU)) %>% group_by(State) %>% dplyr::summarise(IBUmedian=median(IBU))
+ABVmedianState <- mergeDF %>% filter(!is.na(ABV)) %>% group_by(State) %>% dplyr::summarise(ABVmedian=median(ABV))
+
+# Replace IBU NA's with state median value
+mergeDF_no_IBU_NA <- left_join(mergeDF, IBUmedianState, by = "State")
+mergeDF_no_IBU_NA$IBU[is.na(mergeDF_no_IBU_NA$IBU)]  <- as.character(mergeDF_no_IBU_NA$IBUmedian[is.na(mergeDF_no_IBU_NA$IBU)])
+aggr(mergeDF_no_IBU_NA, prop=FALSE, numbers=TRUE) # Still 7 observations IBU NA, because there is no any IBU value available for state 
+
+# Replace 7 IBU NA's in SD with grand median value 35.00
+mergeDF_no_IBU_NA$IBU = str_replace_na(mergeDF_no_IBU_NA$IBU, replacement =  "35")
+mergeDF_no_IBU_NA$IBUmedian = str_replace_na(mergeDF_no_IBU_NA$IBUmedian, replacement =  "35")
+
+# Replace ABV NA's with state median value
+mergeDF_noNA <- left_join(mergeDF_no_IBU_NA, ABVmedianState, by = "State")
+mergeDF_noNA$ABV[is.na(mergeDF_noNA$ABV)] <- as.character(mergeDF_noNA$ABVmedian[is.na(mergeDF_noNA$ABV)])
+aggr(mergeDF_noNA, prop=FALSE, numbers=TRUE)
+mergeDF_noNA$IBU <- as.numeric(mergeDF_noNA$IBU)
+mergeDF_noNA$ABV <- as.numeric(mergeDF_noNA$ABV)
+
+# Plot
+IBU.plotly <- mergeDF_noNA %>% ggplot(aes(x=IBU))+geom_bar()+ggtitle("IBU Distribution") +
+  theme(axis.text.x = element_text(size = 6, angle = 90))
+ggplotly(IBU.plotly)
+ABV.plotly <- mergeDF_noNA %>% ggplot(aes(x=ABV))+geom_bar()+ggtitle("ABV Distribution") +
+  theme(axis.text.x = element_text(size = 6, angle = 90))
+ggplotly(ABV.plotly)
+
+# Statistic ABV, IBU
+summary(mergeDF_noNA)
+```
+
+## Option 2: Alternative option is to use Simple Linear Regression model to predict IBU missing values, to keep the correlation between IBU/ABV no change.
+```{r}
+# Calculate ABV median value of each state
+ABVmedianState <- mergeDF %>% filter(!is.na(ABV)) %>% group_by(State) %>%
+  dplyr::summarise(ABVmedian=median(ABV))
+# Replace 62 NA's in ABV with state level median
+mergeDF_no_ABV_NA <- left_join(mergeDF, ABVmedianState, by = "State")
+
+mergeDF_no_ABV_NA$ABV[is.na(mergeDF_no_ABV_NA$ABV)] <-
+  mergeDF_no_ABV_NA$ABVmedian[is.na(mergeDF_no_ABV_NA$ABV)]
+
+aggr(mergeDF_no_ABV_NA, prop=FALSE, numbers=TRUE)
+
+# Build simple regression model with 1405 pairs of IBU/ABV to get the correlation coef.
+mergeDF_tidy <- mergeDF %>% filter(!is.na(IBU) & !is.na(ABV))
+mod <- lm(mergeDF_tidy$IBU ~ mergeDF_tidy$ABV)
+summary(mod)
+Intercept <- mod$coefficients[1]
+Slope <- mod$coefficients[2]
+
+# Add new column predicted_IBU base on correlation coef.
+# Change negative predicted_IBU to 0, IBU is measured on a scale from 0 to infinite
+mergeDF_no_ABV_NA$predict_IBU <- pmax(Intercept + Slope*mergeDF_no_ABV_NA$ABV, 0)
+summary(mergeDF_no_ABV_NA$IBU)
+
+# Replace 1005 NA's in IBU with predicted_IBU
+mergeDF_no_ABV_NA$IBU[is.na(mergeDF_no_ABV_NA$IBU)] <-
+  mergeDF_no_ABV_NA$predict_IBU[is.na(mergeDF_no_ABV_NA$IBU)]
+summary(mergeDF_no_ABV_NA$IBU)
+
+tidyDF <- mergeDF_no_ABV_NA
+aggr(tidyDF, prop=FALSE, numbers=TRUE)
+```
+
+
+# 4. Compute the median alcohol content(ABV) and international bitterness unit (IBU) for each state. Plot a bar chart to compare.
+```{r}
+# plot IBU median distribution using IBUmedianState data frame
+
+## Calculate IBU and ABV median value of each state
+IBUmedianState <- tidyDF %>% filter(!is.na(IBU)) %>% group_by(State) %>% dplyr::summarise(IBUmedian=median(IBU))
+ABVmedianState <- tidyDF %>% filter(!is.na(ABV)) %>% group_by(State) %>% dplyr::summarise(ABVmedian=median(ABV))
+## Plot
+IBUmedianState$State <- factor(IBUmedianState$State, level = IBUmedianState$State[order(IBUmedianState$IBUmedian)])
+IBUmedianState %>% ggplot(aes(x=State, y=IBUmedian, fill=State)) + geom_bar(stat = "identity") + ggtitle("IBU Median in States")+
+  geom_text(aes(label=IBUmedian), hjust=-0.5) +
+  theme(axis.text.y = element_text(size = 6)) +
+  coord_flip()
+ggplotly()
+
+# plot ABV median distribution using ABVmedianState data frame
+ABVmedianState$State <- factor(ABVmedianState$State, level = ABVmedianState$State[order(ABVmedianState$ABVmedian)])
+ABVmedianState %>% ggplot(aes(x=State, y=ABVmedian, fill=State)) + geom_bar(stat = "identity") + ggtitle("ABV Median in States")+
+  geom_text(aes(label=ABVmedian), hjust=-0.5) +
+  theme(axis.text.y = element_text(size = 6)) +
+  coord_flip()
+ggplotly()
+
+# plot scatter with 51 pairs of median values of ABV and IBU
+ABV_IBU_mergeDF <- merge(ABVmedianState, IBUmedianState, by = "State" )
+ABV_IBU_mergeDF$State <- factor(ABV_IBU_mergeDF$State, droplevels(ABV_IBU_mergeDF$State))
+ABV_IBU_mergeDF %>% ggplot(aes(x=IBUmedian, y=ABVmedian)) + geom_point()
+```
+
+# 5. Which state has the maximum alcoholic (ABV) beer? Which state has the most bitter (IBU) beer?
+```{r}
+# Calculate IBU and ABV max value of each state
+IBUmaxState <- tidyDF %>% filter(!is.na(IBU)) %>% group_by(State) %>% dplyr::summarise(IBUmax=max(IBU))
+ABVmaxState <- tidyDF %>% filter(!is.na(ABV)) %>% group_by(State) %>% dplyr::summarise(ABVmax=max(ABV))
+
+# plot IBU max distribution using IBUmedianState data frame
+IBUmaxState$State <- factor(IBUmaxState$State, level = IBUmaxState$State[order(IBUmaxState$IBUmax)])
+IBUmaxState %>% ggplot(aes(x=State, y=IBUmax, fill=State)) + geom_bar(stat = "identity") + ggtitle("IBU max in States")+
+  geom_text(aes(label=IBUmax), hjust=-0.5) +
+  theme(axis.text.y = element_text(size = 6)) +
+  coord_flip()
+ggplotly()
+
+# plot ABV max distribution using ABVmaxState data frame
+ABVmaxState$State <- factor(ABVmaxState$State, level = ABVmaxState$State[order(ABVmaxState$ABVmax)])
+ABVmaxState %>% ggplot(aes(x=State, y=ABVmax, fill=State)) + geom_bar(stat = "identity") + ggtitle("ABV max in States")+
+  geom_text(aes(label=ABVmax), hjust=-0.5) +
+  theme(axis.text.y = element_text(size = 6)) +
+  coord_flip()
+ggplotly()
+```
+
+# 6. Comment on the summary statistics and distribution of the ABV variable.
+```{r}
+# Create new column for IPA/Ale breakdown
+tidyDF$IPA_Ale <- ifelse(str_detect(tidyDF$Style,regex("IPA", ignore_case = TRUE)),"IPA",ifelse(str_detect(tidyDF$Style,regex("Ale",ignore_case = TRUE)),"Ale","Other"))
+
+# Visualization with ABV data
+##   Bloxplot
+tidyDF %>% ggplot(aes(y=ABV, x=IPA_Ale, fill=as.factor(Ounces))) + geom_boxplot() +
+  xlab("Ale Types (IPA or ALE)") + ylab("ABV") + ggtitle("Boxplot of ABV vs Ale Type")
+tidyDF %>% ggplot(aes(y=ABV, x=as.factor(Ounces), fill=IPA_Ale)) + geom_boxplot() +
+  xlab("Ounces") + ylab("ABV") + ggtitle("Boxplot of ABV vs Ounces")
+##   Histogram
+tidyDF %>% ggplot(aes(x=ABV)) + geom_histogram(fill="blue", color="black")
+##   Barchart
+tidyDF %>% ggplot(aes(x=ABV, fill=IPA_Ale)) + geom_bar(color="black") + xlim(c(0.025,0.100)) +
+  xlab("Alcohol By Volume (ABV)") + ylab("Beer Name Count") + ggtitle("Ale/IPA Weight vs ABV")
+tidyDF %>% ggplot(aes(x=ABV, fill=IPA_Ale)) + geom_bar(color="black", position = "fill") + xlim(c(0.025,0.100)) +
+  xlab("Alcohol By Volume (ABV)") + ylab("Beer Name Count%") + ggtitle("Ale/IPA Weight% vs ABV")
+tidyDF %>% ggplot(aes(x=ABV, fill=as.factor(Ounces))) + geom_bar(color="black") + xlim(c(0.025,0.100)) +
+  xlab("Alcohol By Volume (ABV)") + ylab("Beer Name Count") + ggtitle("Ounce Weight vs ABV")
+
+# Visualization with IBU data
+##   Bloxplot
+tidyDF %>% ggplot(aes(y=IBU, x=IPA_Ale, fill=as.factor(Ounces))) + geom_boxplot() +
+  xlab("Ale Types (IPA or ALE)") + ylab("IBU") + ggtitle("Boxplot of IBU vs Ale Type")
+tidyDF %>% ggplot(aes(y=IBU, x=as.factor(Ounces), fill=IPA_Ale)) + geom_boxplot() +
+  xlab("Ounces") + ylab("IBU") + ggtitle("Boxplot of IBU vs Ounces")
+##   Barchart
+tidyDF %>% ggplot(aes(x=IBU, fill=IPA_Ale)) + geom_bar(color="black") +
+  xlab("International Bitterness Units (IBU)") + ylab("Beer Name Count") + ggtitle("Ale/IPA Weight vs IBU")
+tidyDF %>% ggplot(aes(x=IBU, fill=IPA_Ale)) + geom_bar(color="black", position = "fill") +
+  xlab("International Bitterness Units (IBU)") + ylab("Beer Name Count%") + ggtitle("Ale/IPA Weight% vs IBU")
+tidyDF %>% ggplot(aes(x=IBU, fill=as.factor(Ounces))) + geom_bar(color="black") +
+  xlab("International Bitterness Units (IBU)") + ylab("Beer Name Count") + ggtitle("Ounce Weight vs IBU")
+# Scatter plot ABV vs. IBU
+tidyDF %>% ggplot(aes(x=IBU, y=ABV)) + geom_point(shape=0) + ggtitle("ABV vs IBU") + geom_smooth(method = lm)
+tidyDF %>% ggplot(aes(x=IBU, y=ABV, color=IPA_Ale)) + geom_point() + ggtitle("ABV vs IBU") + geom_smooth(method = lm)
+tidyDF %>% ggplot(aes(x=IBU, y=ABV, color=IPA_Ale)) + geom_point() + ggtitle("ABV vs IBU") + facet_wrap(~State)
+tidyDF %>% ggplot(aes(x=IBU, y=ABV, color=IPA_Ale)) + geom_point() + ggtitle("ABV vs IBU") + facet_wrap(~as.factor(Ounces))
+```
+
+# 7. Is there an apparent relationship between the bitterness of the beer and its alcoholic content? Draw a scatter plot.  Make your best judgment of a relationship and EXPLAIN your answer.
+```{r}
+# Scatter plot and Pearson's correlation with original data
+mergeDF %>% filter(!is.na(IBU) & !is.na(ABV)) %>%
+  ggplot(aes(x=ABV, y=IBU)) + 
+  geom_point(aes(color=State), size=1, position="jitter") + 
+  geom_smooth(method = lm) + 
+  theme_wsj() +
+  xlab("ABV") + ylab("IBU") +
+  ggtitle("Relationship between IBU and ABV")
+ggplotly()
+mergeDF_tidy <- mergeDF %>% filter(!is.na(IBU) & !is.na(ABV))
+cor.test(mergeDF_tidy$IBU, mergeDF_tidy$ABV)
+mod <- lm(mergeDF_tidy$IBU ~mergeDF_tidy$ABV)
+summary(mod)
+
+# Scatter plot and Pearson's correlation with tidy data (no missing value)
+tidyDF %>% ggplot(aes(x=ABV, y=IBU)) + 
+  geom_point(aes(color=State), size=1, position="jitter") + 
+  geom_smooth(method = lm) + 
+  ggtitle("Relationship between IBU and ABV")
+ggplotly()
+cor.test(tidyDF$IBU, tidyDF$ABV)
+mod1 <- lm(tidyDF$IBU ~ tidyDF$ABV)
+summary(mod1)
+```
+
+# 8. Budweiser would also like to investigate the difference with respect to IBU and ABV between IPAs (India Pale Ales) and other types of Ale (any beer with “Ale” in its name other than IPA).  You decide to use KNN clustering to investigate this relationship.  Provide statistical evidence one way or the other. You can of course assume your audience is comfortable with percentages … KNN is very easy to understand.
+```{r}
+table(tidyDF$IPA_Ale) # Ale:963, IPA:571, Other:876
+# Check the Ale: 2nd time with regex(): # Ale:1007, IPA:571, Other:832
+
+tidyDF.knn <- tidyDF %>% filter(IPA_Ale == "IPA" | IPA_Ale == "Ale")
+
+## 
+set.seed(1234)
+splitPerc = .75
+iterations = 50
+numks = 30
+
+masterAcc = matrix(nrow = iterations, ncol = numks)
+  
+for(j in 1:iterations)
+{
+  accs = data.frame(accuracy = numeric(30), k = numeric(30))
+  trainIndices = sample(1:dim(tidyDF.knn)[1],round(splitPerc * dim(tidyDF.knn)[1]))
+  train = tidyDF.knn[trainIndices,]
+  test = tidyDF.knn[-trainIndices,]
+  for(i in 1:numks)
+    {
+    classifications = knn(train[,c(4,5)],test[,c(4,5)],train$IPA_Ale, prob = TRUE, k = i)
+    table(classifications,test$IPA_Ale)
+    CM = confusionMatrix(table(classifications,test$IPA_Ale))
+    masterAcc[j,i] = CM$overall[1]
+  }
+}
+
+MeanAcc = colMeans(masterAcc)
+maxMeanAcc = max(MeanAcc) # k=?
+plot(seq(1,numks,1),MeanAcc, type = "l")
+
+classifications5 = knn(train[,c(4,5)],test[,c(4,5)],train$IPA_Ale, prob = TRUE, k = 5)
+table(classifications5,test$IPA_Ale)
+CM5 = confusionMatrix(table(classifications5,test$IPA_Ale))
+CM5
+```
+
+```{r}
+set.seed(1234)
+splitPerc = .80
+iterations = 50
+numks = 30
+
+masterAcc = matrix(nrow = iterations, ncol = numks)
+  
+for(j in 1:iterations)
+{
+  accs = data.frame(accuracy = numeric(30), k = numeric(30))
+  trainIndices = sample(1:dim(tidyDF.knn)[1],round(splitPerc * dim(tidyDF.knn)[1]))
+  train = tidyDF.knn[trainIndices,]
+  test = tidyDF.knn[-trainIndices,]
+  for(i in 1:numks)
+    {
+    classifications = knn(train[,c(4,5)],test[,c(4,5)],train$IPA_Ale, prob = TRUE, k = i)
+    table(classifications,test$IPA_Ale)
+    CM = confusionMatrix(table(classifications,test$IPA_Ale))
+    masterAcc[j,i] = CM$overall[1]
+  }
+}
+
+MeanAcc = colMeans(masterAcc)
+maxMeanAcc = max(MeanAcc) # k=?
+plot(seq(1,numks,1),MeanAcc, type = "l")
+
+classifications5 = knn(train[,c(4,5)],test[,c(4,5)],train$IPA_Ale, prob = TRUE, k = 6)
+table(classifications5,test$IPA_Ale)
+CM5 = confusionMatrix(table(classifications5,test$IPA_Ale))
+CM5
+```
+
+# Check Budweiser profile
+## Neither Budweiser nor Anheuser-Busch can be found in list of Brewery_name
+## We cannot build Budweiser profile with the available data set
+## Benchmarking with competitors will not be realistic
+```{r}
+tidyDF$BudweiserOrOther <- ifelse(str_detect(tidyDF$Brewery_name,regex("Budweiser", ignore_case = TRUE)),"Budweiser","Other")
+table(tidyDF$BudweiserOrOther)
+head(tidyDF %>% filter(BudweiserOrOther=="Budweiser"),n=50)
+```
+
+
+# 9. Knock their socks off!  Find one other useful inference from the data that you feel Budweiser may be able to find value in.  You must convince them why it is important and back up your conviction with appropriate statistical evidence.
+```{r}
+
+```
+
+
